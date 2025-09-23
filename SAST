@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""
+SAST (Static Application Security Testing) Tool
+Comprehensive security vulnerability scanner for Python code
+"""
+
+import os
+import re
+import ast
+import json
+import sqlite3
+import hashlib
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Tuple
+from dataclasses import dataclass, asdict
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image, ImageDraw, ImageFont
+
+
+@dataclass
+class SecurityFinding:
+    """Data class for security findings"""
+    rule_id: str
+    severity: str
+    title: str
+    description: str
+    file_path: str
+    line_number: int
+    code_snippet: str
+    cwe_id: str = ""
+    owasp_category: str = ""
+    remediation: str = ""
+
+
+class SASTScanner:
+    """Static Application Security Testing Scanner"""
+    
+    def __init__(self, target_directory: str):
+        self.target_directory = Path(target_directory)
+        self.findings: List[SecurityFinding] = []
+        self.stats = {
+            'files_scanned': 0,
+            'total_lines': 0,
+            'critical': 0,
+            'high': 0,
+            'medium': 0,
+            'low': 0,
+            'info': 0
+        }
+        
+        # Security rules database
+        self.security_rules = self._load_security_rules()
+        
+    def _load_security_rules(self) -> Dict[str, Dict]:
+        """Load security rules for vulnerability detection"""
+        return {
+            'sql_injection': {
+                'patterns': [
+                    r'execute\s*\(\s*["\'][^"\']*%[^"\']*["\']',
+                    r'cursor\.execute\s*\(\s*["\'][^"\']*\+[^"\']*["\']',
+                    r'query\s*=\s*["\'][^"\']*%[^"\']*["\']',
+                    r'\.format\s*\([^)]*\)\s*(?:INTO|FROM|WHERE|SELECT)',
+                ],
+                'severity': 'Critical',
+                'cwe': 'CWE-89',
+                'owasp': 'A03:2021 - Injection',
+                'description': 'Potential SQL Injection vulnerability detected'
+            },
+            'command_injection': {
+                'patterns': [
+                    r'os\.system\s*\([^)]*\+',
+                    r'subprocess\.call\s*\([^)]*\+',
+                    r'subprocess\.run\s*\([^)]*\+',
+                    r'eval\s*\([^)]*input',
+                    r'exec\s*\([^)]*input',
+                ],
+                'severity': 'Critical',
+                'cwe': 'CWE-78',
+                'owasp': 'A03:2021 - Injection',
+                'description': 'Potential Command Injection vulnerability detected'
+            },
+            'xss': {
+                'patterns': [
+                    r'render_template_string\s*\([^)]*\+',
+                    r'Markup\s*\([^)]*\+',
+                    r'\.format\s*\([^)]*\).*safe',
+                    r'innerHTML\s*=\s*[^;]*\+',
+                ],
+                'severity': 'High',
+                'cwe': 'CWE-79',
+                'owasp': 'A03:2021 - Injection',
+                'description': 'Potential Cross-Site Scripting (XSS) vulnerability detected'
+            },
+            'hardcoded_secrets': {
+                'patterns': [
+                    r'password\s*=\s*["\'][^"\']{8,}["\']',
+                    r'api_key\s*=\s*["\'][^"\']{16,}["\']',
+                    r'secret\s*=\s*["\'][^"\']{16,}["\']',
+                    r'token\s*=\s*["\'][^"\']{20,}["\']',
+                    r'aws_secret_access_key\s*=\s*["\'][^"\']+["\']',
+                ],
+                'severity': 'High',
+                'cwe': 'CWE-798',
+                'owasp': 'A07:2021 - Identification and Authentication Failures',
+                'description': 'Hardcoded credentials detected'
+            },
+            'insecure_random': {
+                'patterns': [
+                    r'random\.random\s*\(',
+                    r'random\.choice\s*\(',
+                    r'random\.randint\s*\(',
+                    r'time\.time\s*\(\).*seed',
+                ],
+                'severity': 'Medium',
+                'cwe': 'CWE-338',
+                'owasp': 'A02:2021 - Cryptographic Failures',
+                'description': 'Insecure random number generation detected'
+            },
+            'path_traversal': {
+                'patterns': [
+                    r'open\s*\([^)]*\+.*["\']\.\./',
+                    r'file\s*\([^)]*\+.*["\']\.\./',
+                    r'os\.path\.join\s*\([^)]*user_input',
+                ],
+                'severity': 'High',
+                'cwe': 'CWE-22',
+                'owasp': 'A01:2021 - Broken Access Control',
+                'description': 'Potential Path Traversal vulnerability detected'
+            },
+            'weak_crypto': {
+                'patterns': [
+                    r'hashlib\.md5\s*\(',
+                    r'hashlib\.sha1\s*\(',
+                    r'Crypto\.Hash\.MD5',
+                    r'Crypto\.Hash\.SHA1',
+                ],
+                'severity': 'Medium',
+                'cwe': 'CWE-327',
+                'owasp': 'A02:2021 - Cryptographic Failures',
+                'description': 'Weak cryptographic algorithm detected'
+            },
+            'debug_mode': {
+                'patterns': [
+                    r'debug\s*=\s*True',
+                    r'DEBUG\s*=\s*True',
+                    r'app\.run\s*\([^)]*debug\s*=\s*True',
+                ],
+                'severity': 'Medium',
+                'cwe': 'CWE-489',
+                'owasp': 'A05:2021 - Security Misconfiguration',
+                'description': 'Debug mode enabled in production code'
+            }
+        }
+    
+    def scan_file(self, file_path: Path) -> None:
+        """Scan a single file for security vulnerabilities"""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                lines = content.split('\n')
+                
+            self.stats['files_scanned'] += 1
+            self.stats['total_lines'] += len(lines)
+            
+            # Apply security rules
+            for rule_name, rule_config in self.security_rules.items():
+                for pattern in rule_config['patterns']:
+                    matches = re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE)
+                    
+                    for match in matches:
+                        line_number = content[:match.start()].count('\n') + 1
+                        code_snippet = lines[line_number - 1].strip() if line_number <= len(lines) else ""
+                        
+                        finding = SecurityFinding(
+                            rule_id=rule_name,
+                            severity=rule_config['severity'],
+                            title=f"{rule_config['description']} - {rule_name}",
+                            description=rule_config['description'],
+                            file_path=str(file_path),
+                            line_number=line_number,
+                            code_snippet=code_snippet,
+                            cwe_id=rule_config.get('cwe', ''),
+                            owasp_category=rule_config.get('owasp', ''),
+                            remediation=self._get_remediation(rule_name)
+                        )
+                        
+                        self.findings.append(finding)
+                        self._update_severity_stats(rule_config['severity'])
+                        
+        except Exception as e:
+            print(f"Error scanning file {file_path}: {e}")
+    
+    def _get_remediation(self, rule_name: str) -> str:
+        """Get remediation advice for a specific rule"""
+        remediation_map = {
+            'sql_injection': 'Use parameterized queries or prepared statements instead of string concatenation.',
+            'command_injection': 'Use subprocess with a list of arguments instead of shell=True. Validate all input.',
+            'xss': 'Use proper output encoding and escape user input before rendering.',
+            'hardcoded_secrets': 'Store secrets in environment variables or secure credential storage.',
+            'insecure_random': 'Use secrets module for cryptographic operations: secrets.randbelow(), secrets.token_hex().',
+            'path_traversal': 'Validate file paths and use os.path.join() with proper sanitization.',
+            'weak_crypto': 'Use SHA-256 or stronger hashing algorithms instead of MD5/SHA1.',
+            'debug_mode': 'Disable debug mode in production environments.'
+        }
+        return remediation_map.get(rule_name, 'Review code for security implications.')
+    
+    def _update_severity_stats(self, severity: str) -> None:
+        """Update severity statistics"""
+        severity_lower = severity.lower()
+        if severity_lower in self.stats:
+            self.stats[severity_lower] += 1
+    
+    def scan_directory(self) -> None:
+        """Scan entire directory for Python files"""
+        print(f"Starting SAST scan of: {self.target_directory}")
+        
+        python_files = list(self.target_directory.rglob("*.py"))
+        
+        if not python_files:
+            print("No Python files found in the target directory.")
+            return
+        
+        print(f"Found {len(python_files)} Python files to scan...")
+        
+        for file_path in python_files:
+            print(f"Scanning: {file_path}")
+            self.scan_file(file_path)
+        
+        print(f"Scan completed. Found {len(self.findings)} potential vulnerabilities.")
+    
+    def generate_json_report(self, output_path: str = "sast_report.json") -> None:
+        """Generate JSON report of findings"""
+        report_data = {
+            'scan_info': {
+                'target_directory': str(self.target_directory),
+                'scan_date': datetime.now().isoformat(),
+                'scanner_version': '1.0.0'
+            },
+            'statistics': self.stats,
+            'findings': [asdict(finding) for finding in self.findings]
+        }
+        
+        with open(output_path, 'w') as f:
+            json.dump(report_data, f, indent=2)
+        
+        print(f"JSON report saved to: {output_path}")
+    
+    def generate_html_report(self, output_path: str = "sast_report.html") -> None:
+        """Generate HTML report with styling"""
+        html_content = self._create_html_report()
+        
+        with open(output_path, 'w') as f:
+            f.write(html_content)
+        
+        print(f"HTML report saved to: {output_path}")
+    
+    def _create_html_report(self) -> str:
+        """Create HTML report content"""
+        severity_colors = {
+            'Critical': '#DC2626',
+            'High': '#EA580C', 
+            'Medium': '#D97706',
+            'Low': '#65A30D',
+            'Info': '#0284C7'
+        }
+        
+        findings_by_severity = {}
+        for finding in self.findings:
+            if finding.severity not in findings_by_severity:
+                findings_by_severity[finding.severity] = []
+            findings_by_severity[finding.severity].append(finding)
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>SAST Security Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
+                .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                h1 {{ color: #333; border-bottom: 3px solid #007bff; padding-bottom: 10px; }}
+                h2 {{ color: #555; margin-top: 30px; }}
+                .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+                .stat-card {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; text-align: center; }}
+                .stat-number {{ font-size: 2em; font-weight: bold; }}
+                .stat-label {{ font-size: 0.9em; opacity: 0.9; }}
+                .finding {{ margin: 15px 0; padding: 15px; border-left: 4px solid; border-radius: 4px; background: #f9f9f9; }}
+                .critical {{ border-color: {severity_colors['Critical']}; }}
+                .high {{ border-color: {severity_colors['High']}; }}
+                .medium {{ border-color: {severity_colors['Medium']}; }}
+                .low {{ border-color: {severity_colors['Low']}; }}
+                .info {{ border-color: {severity_colors['Info']}; }}
+                .finding-header {{ font-weight: bold; color: #333; margin-bottom: 10px; }}
+                .finding-details {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 10px; }}
+                .code-snippet {{ background: #2d3748; color: #e2e8f0; padding: 10px; border-radius: 4px; font-family: 'Courier New', monospace; overflow-x: auto; }}
+                .severity-badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.8em; font-weight: bold; }}
+                .metadata {{ font-size: 0.9em; color: #666; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🛡️ SAST Security Analysis Report</h1>
+                
+                <div class="metadata">
+                    <p><strong>Target Directory:</strong> {self.target_directory}</p>
+                    <p><strong>Scan Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+                    <p><strong>Total Files Scanned:</strong> {self.stats['files_scanned']}</p>
+                    <p><strong>Total Lines Analyzed:</strong> {self.stats['total_lines']}</p>
+                </div>
+                
+                <h2>📊 Security Summary</h2>
+                <div class="stats">
+                    <div class="stat-card">
+                        <div class="stat-number">{self.stats['critical']}</div>
+                        <div class="stat-label">Critical</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{self.stats['high']}</div>
+                        <div class="stat-label">High</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{self.stats['medium']}</div>
+                        <div class="stat-label">Medium</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number">{self.stats['low']}</div>
+                        <div class="stat-label">Low</div>
+                    </div>
+                </div>
+                
+                <h2>🔍 Security Findings</h2>
+        """
+        
+        for severity in ['Critical', 'High', 'Medium', 'Low', 'Info']:
+            if severity in findings_by_severity:
+                html += f"<h3>{severity} Severity Issues ({len(findings_by_severity[severity])})</h3>"
+                
+                for finding in findings_by_severity[severity]:
+                    html += f"""
+                    <div class="finding {severity.lower()}">
+                        <div class="finding-header">
+                            <span class="severity-badge" style="background-color: {severity_colors[severity]}">{finding.severity}</span>
+                            {finding.title}
+                        </div>
+                        <div class="finding-details">
+                            <div>
+                                <p><strong>File:</strong> {finding.file_path}</p>
+                                <p><strong>Line:</strong> {finding.line_number}</p>
+                                <p><strong>CWE:</strong> {finding.cwe_id}</p>
+                                <p><strong>OWASP:</strong> {finding.owasp_category}</p>
+                                <p><strong>Description:</strong> {finding.description}</p>
+                                <p><strong>Remediation:</strong> {finding.remediation}</p>
+                            </div>
+                            <div>
+                                <strong>Code Snippet:</strong>
+                                <div class="code-snippet">{finding.code_snippet}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """
+        
+        html += """
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+    
+    def create_visualization(self, output_path: str = "sast_charts.png") -> None:
+        """Create security findings visualization"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle('SAST Security Analysis Dashboard', fontsize=16, fontweight='bold')
+        
+        # Severity distribution pie chart
+        severities = ['Critical', 'High', 'Medium', 'Low']
+        counts = [self.stats[s.lower()] for s in severities]
+        colors_pie = ['#DC2626', '#EA580C', '#D97706', '#65A30D']
+        
+        wedges, texts, autotexts = ax1.pie(counts, labels=severities, autopct='%1.1f%%', colors=colors_pie)
+        ax1.set_title('Vulnerability Severity Distribution')
+        
+        # Top vulnerability types
+        vuln_types = {}
+        for finding in self.findings:
+            vuln_types[finding.rule_id] = vuln_types.get(finding.rule_id, 0) + 1
+        
+        if vuln_types:
+            top_vulns = sorted(vuln_types.items(), key=lambda x: x[1], reverse=True)[:8]
+            vuln_names, vuln_counts = zip(*top_vulns)
+            
+            ax2.barh(range(len(vuln_names)), vuln_counts, color='skyblue')
+            ax2.set_yticks(range(len(vuln_names)))
+            ax2.set_yticklabels([name.replace('_', ' ').title() for name in vuln_names])
+            ax2.set_xlabel('Number of Occurrences')
+            ax2.set_title('Top Vulnerability Types')
+        
+        # Files with most issues
+        file_issues = {}
+        for finding in self.findings:
+            file_name = Path(finding.file_path).name
+            file_issues[file_name] = file_issues.get(file_name, 0) + 1
+        
+        if file_issues:
+            top_files = sorted(file_issues.items(), key=lambda x: x[1], reverse=True)[:10]
+            file_names, issue_counts = zip(*top_files)
+            
+            ax3.bar(range(len(file_names)), issue_counts, color='lightcoral')
+            ax3.set_xticks(range(len(file_names)))
+            ax3.set_xticklabels(file_names, rotation=45, ha='right')
+            ax3.set_ylabel('Number of Issues')
+            ax3.set_title('Files with Most Security Issues')
+        
+        # Severity trend (mock timeline)
+        ax4.text(0.5, 0.5, f'Total Issues Found: {len(self.findings)}\nFiles Scanned: {self.stats["files_scanned"]}\nLines Analyzed: {self.stats["total_lines"]}', 
+                horizontalalignment='center', verticalalignment='center', transform=ax4.transAxes,
+                fontsize=14, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
+        ax4.set_title('Scan Summary')
+        ax4.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Visualization saved to: {output_path}")
+    
+    def generate_pdf_report(self, output_path: str = "sast_report.pdf") -> None:
+        """Generate comprehensive PDF report"""
+        doc = SimpleDocTemplate(output_path, pagesize=A4)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        # Title
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Title'],
+            fontSize=24,
+            spaceAfter=30,
+            textColor=colors.darkblue
+        )
+        story.append(Paragraph("SAST Security Analysis Report", title_style))
+        story.append(Spacer(1, 12))
+        
+        # Executive Summary
+        story.append(Paragraph("Executive Summary", styles['Heading1']))
+        summary_text = f"""
+        This report presents the results of a Static Application Security Testing (SAST) analysis 
+        performed on the target directory: <b>{self.target_directory}</b><br/><br/>
+        
+        <b>Scan Statistics:</b><br/>
+        • Files Scanned: {self.stats['files_scanned']}<br/>
+        • Total Lines Analyzed: {self.stats['total_lines']}<br/>
+        • Total Issues Found: {len(self.findings)}<br/>
+        • Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/><br/>
+        
+        <b>Security Risk Summary:</b><br/>
+        • Critical Issues: {self.stats['critical']}<br/>
+        • High Risk Issues: {self.stats['high']}<br/>
+        • Medium Risk Issues: {self.stats['medium']}<br/>
+        • Low Risk Issues: {self.stats['low']}<br/>
+        """
+        story.append(Paragraph(summary_text, styles['Normal']))
+        story.append(Spacer(1, 20))
+        
+        # Vulnerability Details
+        story.append(Paragraph("Detailed Findings", styles['Heading1']))
+        
+        findings_by_severity = {}
+        for finding in self.findings:
+            if finding.severity not in findings_by_severity:
+                findings_by_severity[finding.severity] = []
+            findings_by_severity[finding.severity].append(finding)
+        
+        for severity in ['Critical', 'High', 'Medium', 'Low']:
+            if severity in findings_by_severity:
+                story.append(Paragraph(f"{severity} Severity Issues", styles['Heading2']))
+                
+                # Create table for findings
+                data = [['File', 'Line', 'Issue', 'CWE', 'Description']]
+                
+                for finding in findings_by_severity[severity][:10]:  # Limit to prevent huge PDFs
+                    data.append([
+                        Path(finding.file_path).name,
+                        str(finding.line_number),
+                        finding.rule_id.replace('_', ' ').title(),
+                        finding.cwe_id,
+                        finding.description[:50] + "..." if len(finding.description) > 50 else finding.description
+                    ])
+                
+                table = Table(data, colWidths=[2*inch, 0.5*inch, 1.5*inch, 0.8*inch, 2.2*inch])
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ]))
+                
+                story.append(table)
+                story.append(Spacer(1, 20))
+        
+        # Recommendations
+        story.append(PageBreak())
+        story.append(Paragraph("Security Recommendations", styles['Heading1']))
+        
+        recommendations = """
+        <b>Immediate Actions Required:</b><br/>
+        1. Address all Critical and High severity issues immediately<br/>
+        2. Implement secure coding practices and input validation<br/>
+        3. Use parameterized queries to prevent SQL injection<br/>
+        4. Implement proper output encoding to prevent XSS<br/>
+        5. Store secrets in environment variables or secure vaults<br/><br/>
+        
+        <b>Long-term Security Improvements:</b><br/>
+        1. Integrate SAST tools into CI/CD pipeline<br/>
+        2. Conduct regular security code reviews<br/>
+        3. Provide security training to development team<br/>
+        4. Implement secure development lifecycle (SDLC)<br/>
+        5. Regular penetration testing and vulnerability assessments<br/>
+        """
+        story.append(Paragraph(recommendations, styles['Normal']))
+        
+        doc.build(story)
+        print(f"PDF report saved to: {output_path}")
+
+
+def create_demo_vulnerable_code():
+    """Create demo vulnerable code for testing"""
+    demo_code = '''#!/usr/bin/env python3
+"""
+Demo vulnerable Python application for SAST testing
+WARNING: This code contains intentional vulnerabilities for demonstration
+"""
+
+import os
+import sqlite3
+import subprocess
+from flask import Flask, request, render_template_string
+
+app = Flask(__name__)
+
+# Hardcoded credentials (vulnerability)
+API_KEY = "sk-1234567890abcdef"
+DATABASE_PASSWORD = "admin123"
+
+# SQL Injection vulnerability
+def get_user_data(user_id):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    # Vulnerable: Direct string concatenation
+    query = "SELECT * FROM users WHERE id = '" + user_id + "'"
+    cursor.execute(query)
+    return cursor.fetchall()
+
+# Command Injection vulnerability  
+def backup_file(filename):
+    # Vulnerable: User input directly in system command
+    os.system("cp " + filename + " /backup/")
+
+# XSS vulnerability
+@app.route('/profile')
+def user_profile():
+    name = request.args.get('name', '')
+    # Vulnerable: Direct template rendering with user input
+    template = "<h1>Welcome " + name + "</h1>"
+    return render_template_string(template)
+
+# Weak cryptography
+import hashlib
+def hash_password(password):
+    # Vulnerable: Using MD5 for passwords
+    return hashlib.md5(password.encode()).hexdigest()
+
+# Path traversal vulnerability
+def read_file(filename):
+    # Vulnerable: No path validation
+    with open("/var/data/" + filename, 'r') as f:
+        return f.read()
+
+# Insecure random number generation
+import random
+def generate_session_token():
+    # Vulnerable: Using predictable random
+    return str(random.randint(1000000, 9999999))
+
+# Debug mode enabled (vulnerability)
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0')
+'''
+    
+    with open('vulnerable_demo.py', 'w') as f:
+        f.write(demo_code)
+    
+    print("Created vulnerable_demo.py for testing")
+
+
+def main():
+    """Main function to demonstrate SAST tool"""
+    print("🛡️ SAST Security Testing Tool")
+    print("=" * 50)
+    
+    # Create demo vulnerable code
+    create_demo_vulnerable_code()
+    
+    # Initialize scanner
+    target_dir = "."  # Current directory
+    scanner = SASTScanner(target_dir)
+    
+    # Perform scan
+    scanner.scan_directory()
+    
+    if not scanner.findings:
+        print("No security issues found!")
+        return
+    
+    # Generate reports
+    print("\n📊 Generating Reports...")
+    
+    # JSON Report
+    scanner.generate_json_report("sast_report.json")
+    
+    # HTML Report  
+    scanner.generate_html_report("sast_report.html")
+    
+    # Visualization
+    scanner.create_visualization("sast_security_dashboard.png")
+    
+    # PDF Report
+    try:
+        scanner.generate_pdf_report("sast_comprehensive_report.pdf")
+    except ImportError:
+        print("ReportLab not installed. Skipping PDF generation.")
+        print("Install with: pip install reportlab")
+    
+    # Print summary
+    print(f"\n📋 Scan Summary:")
+    print(f"Files Scanned: {scanner.stats['files_scanned']}")
+    print(f"Total Issues: {len(scanner.findings)}")
+    print(f"Critical: {scanner.stats['critical']}")
+    print(f"High: {scanner.stats['high']}")  
+    print(f"Medium: {scanner.stats['medium']}")
+    print(f"Low: {scanner.stats['low']}")
+    
+    print("\n📁 Generated Files:")
+    print("• sast_report.json - Detailed JSON report")
+    print("• sast_report.html - Interactive HTML dashboard")
+    print("• sast_security_dashboard.png - Security metrics visualization") 
+    print("• sast_comprehensive_report.pdf - Executive PDF report")
+
+
+if __name__ == "__main__":
+    main()
